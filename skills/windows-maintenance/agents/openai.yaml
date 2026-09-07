@@ -1,0 +1,6 @@
+interface:
+  display_name: "Windows 电脑维护"
+  short_description: "采集软硬件与固件信息，生成中文报告和前后对比，按授权维护并保留回退记录"
+  default_prompt: "使用 $windows-maintenance 按我本次说明的范围检查这台 Windows 电脑，生成报告和前后对比，并按已有授权完成维护。"
+policy:
+  allow_implicit_invocation: true

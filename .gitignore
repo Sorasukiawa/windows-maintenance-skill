@@ -1,0 +1,17 @@
+work/
+outputs/
+artifacts/
+test-results/
+fixture-*/
+*.log
+*.evtx
+*.dmp
+*.zip
+*.tmp
+*.bak
+.env
+.env.*
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
