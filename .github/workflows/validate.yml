@@ -20,8 +20,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Syntax, references and isolated behavior tests
-        shell: ${{ matrix.shell }}
+      - name: Validate with Windows PowerShell 5.1
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: |
+          $testPath = Join-Path $env:RUNNER_TEMP ('maintenance-ci-' + [guid]::NewGuid().ToString('N'))
+          & .\tests\Invoke-CI.ps1 -WorkDirectory $testPath
+      - name: Validate with PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         run: |
           $testPath = Join-Path $env:RUNNER_TEMP ('maintenance-ci-' + [guid]::NewGuid().ToString('N'))
           & .\tests\Invoke-CI.ps1 -WorkDirectory $testPath
