@@ -8,7 +8,16 @@ function ConvertTo-MaintenanceCanonicalValue {
     if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime.ToString('o') }
     # Pipeline-decorated strings can satisfy -is [pscustomobject] as well as -is [string].
     # Preserve scalar values before examining their adapted PSObject properties (e.g. Length).
-    if ($Value -is [string] -or $Value -is [bool] -or $Value.GetType().IsPrimitive -or $Value -is [decimal] -or $Value -is [Guid]) { return $Value }
+    if ($Value -is [string]) {
+        if ($Value -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$') {
+            $dto = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$dto)) {
+                return $dto.UtcDateTime.ToString('o')
+            }
+        }
+        return $Value
+    }
+    if ($Value -is [bool] -or $Value.GetType().IsPrimitive -or $Value -is [decimal] -or $Value -is [Guid]) { return $Value }
     if ($Value -is [System.Collections.IDictionary]) {
         $map=[ordered]@{}
         foreach ($key in @($Value.Keys | Sort-Object)) { $map[$key]=ConvertTo-MaintenanceCanonicalValue $Value[$key] }
@@ -29,6 +38,21 @@ function ConvertTo-MaintenanceCanonicalValue {
 function Get-MaintenanceCanonicalJson {
     param($Value)
     ConvertTo-Json -InputObject (ConvertTo-MaintenanceCanonicalValue $Value) -Depth 30 -Compress
+}
+
+function Format-MaintenanceDisplayJson {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $json = Get-MaintenanceCanonicalJson $Value
+    [regex]::Replace($json, '\\u([0-9a-fA-F]{4})', {
+        param($m)
+        $code = [Convert]::ToInt32($m.Groups[1].Value, 16)
+        if ($code -ge 0x20 -and $code -ne 0x22 -and $code -ne 0x5C) {
+            [string][char]$code
+        } else {
+            $m.Value
+        }
+    })
 }
 
 function Compare-MaintenanceSnapshot {
@@ -56,10 +80,23 @@ function Compare-MaintenanceSnapshot {
             if ($null -eq $reason) {
                 foreach ($key in @(@($bm.Keys)+@($am.Keys) | Sort-Object -Unique)) {
                     $change=$null
+                    $changedFields=New-Object 'System.Collections.Generic.List[string]'
                     if (-not $bm.ContainsKey($key)) { $change='Added' }
                     elseif (-not $am.ContainsKey($key)) { $change='Removed' }
-                    elseif ((Get-MaintenanceCanonicalJson $bm[$key]) -cne (Get-MaintenanceCanonicalJson $am[$key])) { $change='Changed' }
-                    if ($null -ne $change) { $changes.Add([pscustomobject]@{Key=$key;Change=$change;Before=$bm[$key];After=$am[$key]}) }
+                    elseif ((Get-MaintenanceCanonicalJson $bm[$key]) -cne (Get-MaintenanceCanonicalJson $am[$key])) {
+                        $change='Changed'
+                        $bCanon=ConvertTo-MaintenanceCanonicalValue $bm[$key]
+                        $aCanon=ConvertTo-MaintenanceCanonicalValue $am[$key]
+                        if ($bCanon -is [System.Collections.IDictionary] -and $aCanon -is [System.Collections.IDictionary]) {
+                            foreach ($prop in @(@($bCanon.Keys)+@($aCanon.Keys) | Sort-Object -Unique)) {
+                                $hasB=$bCanon.Contains($prop); $hasA=$aCanon.Contains($prop)
+                                if ((-not $hasB) -or (-not $hasA) -or ((Get-MaintenanceCanonicalJson $bCanon[$prop]) -cne (Get-MaintenanceCanonicalJson $aCanon[$prop]))) {
+                                    $changedFields.Add([string]$prop)
+                                }
+                            }
+                        }
+                    }
+                    if ($null -ne $change) { $changes.Add([pscustomobject]@{Key=$key;Change=$change;ChangedFields=@($changedFields.ToArray());Before=$bm[$key];After=$am[$key]}) }
                 }
             }
         }
@@ -78,15 +115,16 @@ function ConvertTo-MaintenanceCell {
     return $s
 }
 
-function Export-MaintenanceReport {
+function Resolve-MaintenanceReportPaths {
     [CmdletBinding()]
-    param([Parameter(Mandatory=$true)]$InputObject,[Parameter(Mandatory=$true)][string]$JsonPath,[Parameter(Mandatory=$true)][string]$MarkdownPath)
-    if ($InputObject.Schema -notin @('windows-maintenance.snapshot/v1','windows-maintenance.comparison/v1')) { throw 'Unsupported report schema.' }
+    param([Parameter(Mandatory=$true)][string]$JsonPath,[Parameter(Mandatory=$true)][string]$MarkdownPath)
     $paths=@($JsonPath,$MarkdownPath) | ForEach-Object {
         if ($_ -notmatch '^[a-zA-Z]:[\\/]') { throw 'Report paths must be fully qualified local drive paths.' }
         $full=[IO.Path]::GetFullPath($_)
         if (Test-Path -LiteralPath $full) { throw "Report already exists: $full" }
-        $parent=Get-Item -LiteralPath ([IO.Path]::GetDirectoryName($full)) -Force -ErrorAction Stop
+        $parentDir=[IO.Path]::GetDirectoryName($full)
+        if ([string]::IsNullOrWhiteSpace($parentDir) -or -not (Test-Path -LiteralPath $parentDir)) { throw "Report parent directory does not exist: $parentDir" }
+        $parent=Get-Item -LiteralPath $parentDir -Force -ErrorAction Stop
         if (-not $parent.PSIsContainer) { throw 'Report parent must be a directory.' }
         while ($null -ne $parent) {
             if (($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Report parent contains a reparse point.' }
@@ -94,7 +132,16 @@ function Export-MaintenanceReport {
         }
         $full
     }
-    if ($paths[0] -eq $paths[1]) { throw 'JSON and Markdown paths must differ.' }
+    if ($paths[0].Equals($paths[1],[StringComparison]::OrdinalIgnoreCase)) { throw 'JSON and Markdown paths must differ.' }
+    [pscustomobject]@{JsonPath=$paths[0];MarkdownPath=$paths[1]}
+}
+
+function Export-MaintenanceReport {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)]$InputObject,[Parameter(Mandatory=$true)][string]$JsonPath,[Parameter(Mandatory=$true)][string]$MarkdownPath)
+    if ($InputObject.Schema -notin @('windows-maintenance.snapshot/v1','windows-maintenance.comparison/v1')) { throw 'Unsupported report schema.' }
+    $resolved=Resolve-MaintenanceReportPaths -JsonPath $JsonPath -MarkdownPath $MarkdownPath
+    $paths=@($resolved.JsonPath,$resolved.MarkdownPath)
     $lines=New-Object 'System.Collections.Generic.List[string]'
     $lines.Add('# Windows 维护采集报告')
     $lines.Add(''); $lines.Add(('采集时间：' + (ConvertTo-MaintenanceCell $InputObject.CapturedUtc)))
@@ -104,9 +151,10 @@ function Export-MaintenanceReport {
         foreach ($c in $InputObject.Collections) {
             $lines.Add(''); $lines.Add(('## ' + (ConvertTo-MaintenanceCell $c.Name) + ' — ' + $c.ComparisonStatus))
             if ($c.Reason) { $lines.Add(''); $lines.Add((ConvertTo-MaintenanceCell $c.Reason)) }
-            $lines.Add(''); $lines.Add('| 对象 | 差异 | 原观测值 | 新观测值 |'); $lines.Add('|---|---|---|---|')
+            $lines.Add(''); $lines.Add('| 对象 | 差异 | 变更字段 | 原观测值 | 新观测值 |'); $lines.Add('|---|---|---|---|---|')
             foreach ($change in $c.Changes) {
-                $lines.Add(('| {0} | {1} | {2} | {3} |' -f (ConvertTo-MaintenanceCell $change.Key),$change.Change,(ConvertTo-MaintenanceCell (Get-MaintenanceCanonicalJson $change.Before)),(ConvertTo-MaintenanceCell (Get-MaintenanceCanonicalJson $change.After))))
+                $fieldsText = if ($change.PSObject.Properties.Name -contains 'ChangedFields' -and @($change.ChangedFields).Count -gt 0) { $change.ChangedFields -join ', ' } else { '-' }
+                $lines.Add(('| {0} | {1} | {2} | {3} | {4} |' -f (ConvertTo-MaintenanceCell $change.Key),$change.Change,(ConvertTo-MaintenanceCell $fieldsText),(ConvertTo-MaintenanceCell (Format-MaintenanceDisplayJson $change.Before)),(ConvertTo-MaintenanceCell (Format-MaintenanceDisplayJson $change.After))))
             }
         }
     } else {
@@ -115,7 +163,7 @@ function Export-MaintenanceReport {
         foreach ($c in $InputObject.Collections) { $lines.Add(('| {0} | {1} | {2} | {3} |' -f (ConvertTo-MaintenanceCell $c.Name),$c.QueryStatus,$c.Complete,@($c.Data).Count)) }
         foreach ($c in $InputObject.Collections) {
             $lines.Add(''); $lines.Add(('## ' + (ConvertTo-MaintenanceCell $c.Name)))
-            $lines.Add(''); $lines.Add(('查询来源：' + (ConvertTo-MaintenanceCell (Get-MaintenanceCanonicalJson $c.Scope))))
+            $lines.Add(''); $lines.Add(('查询来源：' + (ConvertTo-MaintenanceCell (Format-MaintenanceDisplayJson $c.Scope))))
             if ($c.PSObject.Properties.Name -contains 'Meaning') { $lines.Add(''); $lines.Add((ConvertTo-MaintenanceCell $c.Meaning)) }
             foreach ($err in @($c.Errors)) { $lines.Add(''); $lines.Add(('采集错误：' + (ConvertTo-MaintenanceCell $err.Message))) }
             $lines.Add(''); $lines.Add('| 对象 | 观测字段 |'); $lines.Add('|---|---|')
@@ -123,7 +171,7 @@ function Export-MaintenanceReport {
             foreach ($row in @($c.Data | Select-Object -First 80)) {
                 $display=[ordered]@{}
                 foreach ($p in $row.PSObject.Properties) { if ($p.Name -notin @('Key','Xml')) { $display[$p.Name]=$p.Value } }
-                $lines.Add(('| {0} | {1} |' -f (ConvertTo-MaintenanceCell $row.Key),(ConvertTo-MaintenanceCell (Get-MaintenanceCanonicalJson $display))))
+                $lines.Add(('| {0} | {1} |' -f (ConvertTo-MaintenanceCell $row.Key),(ConvertTo-MaintenanceCell (Format-MaintenanceDisplayJson $display))))
             }
             if (@($c.Data).Count -gt 80) { $lines.Add(''); $lines.Add('本节只预览前 80 项，全部数据保存在同名 JSON 报告。') }
         }
@@ -139,4 +187,4 @@ function Export-MaintenanceReport {
     }
 }
 
-Export-ModuleMember -Function Compare-MaintenanceSnapshot,Export-MaintenanceReport
+Export-ModuleMember -Function Compare-MaintenanceSnapshot,Resolve-MaintenanceReportPaths,Export-MaintenanceReport

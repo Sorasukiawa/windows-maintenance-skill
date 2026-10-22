@@ -12,6 +12,7 @@ function Invoke-MaintenanceRead {
     $data = New-Object 'System.Collections.Generic.List[object]'
     $errors = New-Object 'System.Collections.Generic.List[object]'
     $ErrorActionPreference = 'Stop'
+    $terminated = $false
     try {
         & $Action 2>&1 | ForEach-Object {
             if ($_ -is [System.Management.Automation.ErrorRecord]) {
@@ -19,11 +20,12 @@ function Invoke-MaintenanceRead {
             } else { $data.Add($_) }
         }
     } catch {
+        $terminated = $true
         $errors.Add([pscustomobject]@{Message=$_.Exception.Message;Id=$_.FullyQualifiedErrorId})
     }
     $status = 'Succeeded'
     if ($errors.Count -gt 0) {
-        if ($data.Count -gt 0) { $status = 'Partial' } else { $status = 'Failed' }
+        if ($data.Count -gt 0 -or (-not $terminated)) { $status = 'Partial' } else { $status = 'Failed' }
     } elseif ($data.Count -eq 0) { $status = 'Empty' }
     [pscustomobject]@{
         Name=$Name;Started=$started.ToString('o');Finished=[DateTimeOffset]::Now.ToString('o')
@@ -32,11 +34,18 @@ function Invoke-MaintenanceRead {
 }
 
 function Resolve-MaintenanceLocalPath {
-    param([Parameter(Mandatory=$true)][string]$Path)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [switch]$RequireDirectory
+    )
     # Restrict this local-maintenance helper to fully qualified drive paths.
     if ($Path -notmatch '^[a-zA-Z]:[\\/]') { throw 'A fully qualified local drive path is required.' }
     $full = [IO.Path]::GetFullPath($Path)
     $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($RequireDirectory -and (-not $item.PSIsContainer)) {
+        throw 'Path must be an existing directory.'
+    }
     $cursor = $item
     while ($null -ne $cursor) {
         if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -55,10 +64,7 @@ function Resolve-MaintenanceChildPath {
         [Parameter(Mandatory=$true)][string]$Root,
         [Parameter(Mandatory=$true)][string]$Path
     )
-    $rootFull = Resolve-MaintenanceLocalPath -Path $Root
-    if (-not (Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop).PSIsContainer) {
-        throw 'Root must be an existing directory.'
-    }
+    $rootFull = Resolve-MaintenanceLocalPath -Path $Root -RequireDirectory
     $pathFull = Resolve-MaintenanceLocalPath -Path $Path
     $rootComparable = $rootFull.TrimEnd([char[]]@('\','/'))
     $pathComparable = $pathFull.TrimEnd([char[]]@('\','/'))
@@ -77,10 +83,7 @@ function Get-MaintenanceTreeSize {
         [Parameter(Mandatory=$true)][string]$Path,
         [ValidateRange(0,86400)][double]$MaxSeconds = 30
     )
-    $full = Resolve-MaintenanceLocalPath -Path $Path
-    if (-not (Get-Item -LiteralPath $full -Force -ErrorAction Stop).PSIsContainer) {
-        throw 'Path must be an existing directory.'
-    }
+    $full = Resolve-MaintenanceLocalPath -Path $Path -RequireDirectory
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $stack = New-Object 'System.Collections.Generic.Stack[string]'
     $stack.Push($full)
@@ -124,4 +127,4 @@ function Get-MaintenanceTreeSize {
     }
 }
 
-Export-ModuleMember -Function Invoke-MaintenanceRead,Resolve-MaintenanceChildPath,Get-MaintenanceTreeSize
+Export-ModuleMember -Function Invoke-MaintenanceRead,Resolve-MaintenanceLocalPath,Resolve-MaintenanceChildPath,Get-MaintenanceTreeSize

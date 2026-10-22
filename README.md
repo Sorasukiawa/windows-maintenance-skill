@@ -53,7 +53,7 @@ From the repository root:
 & .\tests\Invoke-CI.ps1 -WorkDirectory (Join-Path $env:TEMP ('maintenance-ci-' + [guid]::NewGuid().ToString('N')))
 ```
 
-The Windows CI matrix runs syntax/reference validation, 31 inventory/comparison/reporting assertions, and 15 original helper assertions in both PowerShell versions. Fixtures are isolated; CI does not update, repair, or clean the runner. Check the repository's Actions page for actual hosted-run results.
+The Windows CI matrix runs syntax/reference validation, 36 inventory/comparison/reporting assertions, and 17 original helper assertions in both PowerShell versions. Fixtures are isolated; CI does not update, repair, or clean the runner. Check the repository's Actions page for actual hosted-run results.
 
 ## Boundaries
 

@@ -15,9 +15,10 @@ foreach ($file in $sources) {
 }
 $entry=Get-Content -LiteralPath (Join-Path $skill 'SKILL.md') -Raw -Encoding UTF8
 if ($entry -notmatch '(?s)^---\r?\nname: windows-maintenance\r?\ndescription: [^\r\n]+\r?\n---') { throw 'Invalid skill front matter.' }
-foreach ($file in @(Get-ChildItem -LiteralPath $repo -Recurse -File -Filter '*.md')) {
+foreach ($file in @(Get-ChildItem -LiteralPath $repo -Recurse -File -Filter '*.md' | Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' })) {
     $markdown=Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
-    foreach ($link in [regex]::Matches($markdown,'\]\(([^)]+)\)')) {
+    $withoutFences=[regex]::Replace($markdown,'(?s)```.*?```','')
+    foreach ($link in [regex]::Matches($withoutFences,'\]\(([^)]+)\)')) {
         $target=$link.Groups[1].Value
         if ($target -match '^(https?://|#)') { continue }
         $relative=($target -split '#',2)[0]

@@ -28,8 +28,11 @@ $r = Invoke-MaintenanceRead -Name 'failure' -Action { throw 'Access denied' }
 Assert-True ($r.QueryStatus -eq 'Failed' -and $r.Errors.Count -eq 1) 'permission failure is not success'
 $r = Invoke-MaintenanceRead -Name 'partial' -Action { 'first'; Write-Error 'second inaccessible' -ErrorAction Continue }
 Assert-True ($r.QueryStatus -eq 'Partial' -and $r.Data.Count -eq 1 -and $r.Errors.Count -eq 1) 'partial output retains error'
+$r = Invoke-MaintenanceRead -Name 'empty-partial' -Action { Write-Error 'Historical window incomplete' -ErrorAction Continue }
+Assert-True ($r.QueryStatus -eq 'Partial' -and $r.Data.Count -eq 0 -and $r.Errors.Count -eq 1) 'non-terminating warning on empty result is partial'
 $safe = Resolve-MaintenanceChildPath -Root $inside -Path (Join-Path $inside 'one.bin')
 Assert-True ($safe -eq (Join-Path $inside 'one.bin')) 'literal child accepted'
+Assert-Rejected { Resolve-MaintenanceLocalPath -Path (Join-Path $inside 'one.bin') -RequireDirectory } 'file rejected when directory required'
 Assert-Rejected { Resolve-MaintenanceChildPath -Root $inside -Path $inside } 'root itself rejected'
 Assert-Rejected { Resolve-MaintenanceChildPath -Root $inside -Path ($inside + '\') } 'root with trailing slash rejected'
 Assert-Rejected { Resolve-MaintenanceChildPath -Root $inside -Path (Join-Path $outside 'external.bin') } 'sibling rejected'

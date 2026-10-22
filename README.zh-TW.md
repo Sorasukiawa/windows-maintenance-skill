@@ -51,7 +51,7 @@ New-Item -ItemType Directory -Path $runDir -ErrorAction Stop | Out-Null
 & .\tests\Invoke-CI.ps1 -WorkDirectory (Join-Path $env:TEMP ('maintenance-ci-' + [guid]::NewGuid().ToString('N')))
 ```
 
-CI 在 Windows 上分別使用 PowerShell 5.1 與 7，執行語法／引用檢查、31 項新版行為斷言及 15 項原有輔助函式斷言。測試只使用隔離資料，不更新、修復或清理測試主機。託管執行結果以倉庫 Actions 頁面為準。
+CI 在 Windows 上分別使用 PowerShell 5.1 與 7，執行語法／引用檢查、36 項新版行為斷言及 17 項原有輔助函式斷言。測試只使用隔離資料，不更新、修復或清理測試主機。託管執行結果以倉庫 Actions 頁面為準。
 
 ## 限制與隱私
 

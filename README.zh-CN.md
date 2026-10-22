@@ -12,7 +12,7 @@
 
 | 能力 | 实现 |
 |---|---|
-| 本地整机盘点 | Windows、主板/BIOS、CPU/内存、磁盘、驱动、软件登记、自启动、事件与 Defender 状态 |
+| 本地整机盘点 | Windows、主板/BIOS、CPU/内存/GPU、磁盘、驱动、软件登记、自启动（含 StartupApproved）、事件与 Defender 状态 |
 | 目录分类 | 识别部分依赖/生成缓存、项目元数据与用户资料；统计逻辑大小并跳过连接点 |
 | JSON 和中文报告 | 保留查询来源、错误、时间、完整性及未知值 |
 | 前后对比 | 同机、同来源、同用户/权限范围下比较；失败或不完整时输出 Incomparable |
@@ -61,7 +61,7 @@ $scripts = Join-Path (Get-Location) 'skills\windows-maintenance\scripts'
 
 ## 验证与限制
 
-CI 在 Windows 上分别使用 PowerShell 5.1 和 PowerShell 7，运行语法/引用检查、31 项新版行为测试及 15 项原有辅助函数测试。所有测试只使用临时夹具，包含连接点、失败/超时、未知值、不同来源、大小写参数和报告保存场景。
+CI 在 Windows 上分别使用 PowerShell 5.1 和 PowerShell 7，运行语法/引用检查、36 项新版行为测试及 17 项原有辅助函数测试。所有测试只使用临时夹具，包含连接点、失败/超时、未知值、不同来源、大小写参数和报告保存场景。
 
 ```powershell
 & .\tests\Invoke-CI.ps1 -WorkDirectory (Join-Path $env:TEMP ('maintenance-ci-' + [guid]::NewGuid().ToString('N')))

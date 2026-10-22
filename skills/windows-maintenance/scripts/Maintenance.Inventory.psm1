@@ -15,7 +15,7 @@ function Get-MaintenanceMachineKey {
 function Get-MaintenanceDirectoryInventory {
     [CmdletBinding()]
     param([Parameter(Mandatory=$true)][string[]]$Path,[ValidateRange(1,10)][int]$MaxDepth=3,[ValidateRange(0,3600)][double]$MaxSeconds=30,[ValidateRange(1,1000000)][int]$MaxEntries=100000)
-    $roots=@(foreach ($p in $Path) { (Get-MaintenanceTreeSize -Path $p -MaxSeconds 0).Path.TrimEnd([char[]]@('\','/')) + '\' })
+    $roots=@(foreach ($p in $Path) { (Resolve-MaintenanceLocalPath -Path $p -RequireDirectory).TrimEnd([char[]]@('\','/')) + '\' })
     for ($i=0;$i -lt $roots.Count;$i++) {
         for ($j=0;$j -lt $roots.Count;$j++) {
             if ($i -ne $j -and $roots[$i].StartsWith($roots[$j],[StringComparison]::OrdinalIgnoreCase)) { throw 'Overlapping or duplicate scan roots are not allowed.' }
@@ -24,46 +24,67 @@ function Get-MaintenanceDirectoryInventory {
     $clock=[Diagnostics.Stopwatch]::StartNew(); $started=[DateTime]::UtcNow.ToString('o')
     $errors=New-Object 'System.Collections.Generic.List[object]'
     $rows=New-Object 'System.Collections.Generic.List[object]'
-    $stack=New-Object 'System.Collections.Generic.Stack[object]'
+    $queue=New-Object 'System.Collections.Generic.Queue[object]'
+    $incompleteKeys=New-Object 'System.Collections.Generic.HashSet[string]'([StringComparer]::OrdinalIgnoreCase)
     $summaries=@{}; [long]$seen=0; [long]$links=0; $interrupted=$false
     foreach ($root in $roots) {
         $item=[pscustomobject]@{Key=$root;Path=$root;Kind='RootSummary';Category='SelectedRoot';LogicalBytes=[long]0;Files=[long]0;DeletionAuthorized=$false;Complete=$false}
         $rows.Add($item); $summaries[$root]=$item
-        $stack.Push([pscustomobject]@{Path=$root;Depth=0;Ancestors=@($root)})
+        $queue.Enqueue([pscustomobject]@{Path=$root;Depth=0;Ancestors=@($root)})
     }
-    while ($stack.Count -gt 0) {
+    while ($queue.Count -gt 0) {
         if ($clock.Elapsed.TotalSeconds -ge $MaxSeconds -or $seen -ge $MaxEntries) { $interrupted=$true; break }
-        $node=$stack.Pop()
+        $node=$queue.Dequeue()
         try {
             $dir=Get-Item -LiteralPath $node.Path -Force -ErrorAction Stop
             if (($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $links++; continue }
             foreach ($entry in ([IO.DirectoryInfo]$dir).EnumerateFileSystemInfos()) {
-                if ($clock.Elapsed.TotalSeconds -ge $MaxSeconds -or $seen -ge $MaxEntries) { $interrupted=$true; break }
+                if ($clock.Elapsed.TotalSeconds -ge $MaxSeconds -or $seen -ge $MaxEntries) {
+                    $interrupted=$true
+                    foreach ($ancestorKey in $node.Ancestors) { $null=$incompleteKeys.Add($ancestorKey) }
+                    break
+                }
                 $seen++
-                if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $links++; continue }
-                if (($entry.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
-                    $ancestors=@($node.Ancestors)
-                    if ($node.Depth -lt $MaxDepth) {
-                        $category='NeedsReview'
-                        if ($entry.Name -eq 'node_modules' -and [IO.File]::Exists((Join-Path $dir.FullName 'package.json'))) { $category='DependencyCache' }
-                        elseif ($entry.Name -eq '__pycache__') { $category='GeneratedPythonCache' }
-                        elseif ($entry.Name -eq '.git') { $category='RepositoryMetadata' }
-                        elseif ($entry.Name -match '^(models?|checkpoints?|saves?|recordings?|downloads?|documents?)$') { $category='UserData' }
-                        elseif ($entry.Name -in @('build','dist') -and ([IO.File]::Exists((Join-Path $dir.FullName 'package.json')) -or [IO.File]::Exists((Join-Path $dir.FullName 'pyproject.toml')))) { $category='BuildOutputReview' }
-                        $key=$entry.FullName.TrimEnd('\') + '\'
-                        $row=[pscustomobject]@{Key=$key;Path=$entry.FullName;Kind='DirectorySummary';Category=$category;LogicalBytes=[long]0;Files=[long]0;DeletionAuthorized=$false;Complete=$false}
-                        $summaries[$key]=$row; $rows.Add($row); $ancestors+=@($key)
+                $createdKey=$null
+                try {
+                    if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $links++; continue }
+                    if (($entry.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                        $ancestors=@($node.Ancestors)
+                        if ($node.Depth -lt $MaxDepth) {
+                            $category='NeedsReview'
+                            if ($entry.Name -eq 'node_modules' -and [IO.File]::Exists((Join-Path $dir.FullName 'package.json'))) { $category='DependencyCache' }
+                            elseif ($entry.Name -eq '__pycache__') { $category='GeneratedPythonCache' }
+                            elseif ($entry.Name -eq '.git') { $category='RepositoryMetadata' }
+                            elseif ($entry.Name -match '^(models?|checkpoints?|saves?|recordings?|downloads?|documents?)$') { $category='UserData' }
+                            elseif ($entry.Name -in @('build','dist') -and ([IO.File]::Exists((Join-Path $dir.FullName 'package.json')) -or [IO.File]::Exists((Join-Path $dir.FullName 'pyproject.toml')))) { $category='BuildOutputReview' }
+                            $key=$entry.FullName.TrimEnd('\') + '\'
+                            $createdKey=$key
+                            $row=[pscustomobject]@{Key=$key;Path=$entry.FullName;Kind='DirectorySummary';Category=$category;LogicalBytes=[long]0;Files=[long]0;DeletionAuthorized=$false;Complete=$false}
+                            $summaries[$key]=$row; $rows.Add($row); $ancestors+=@($key)
+                        }
+                        $queue.Enqueue([pscustomobject]@{Path=$entry.FullName;Depth=($node.Depth+1);Ancestors=$ancestors})
+                    } else {
+                        $len=$entry.Length
+                        foreach ($key in $node.Ancestors) { $summaries[$key].LogicalBytes+=$len; $summaries[$key].Files++ }
                     }
-                    $stack.Push([pscustomobject]@{Path=$entry.FullName;Depth=($node.Depth+1);Ancestors=$ancestors})
-                } else {
-                    foreach ($key in $node.Ancestors) { $summaries[$key].LogicalBytes+=$entry.Length; $summaries[$key].Files++ }
+                } catch {
+                    $errors.Add([pscustomobject]@{Path=$entry.FullName;Message=$_.Exception.Message})
+                    foreach ($ancestorKey in $node.Ancestors) { $null=$incompleteKeys.Add($ancestorKey) }
+                    if ($null -ne $createdKey) { $null=$incompleteKeys.Add($createdKey) }
                 }
             }
-        } catch { $errors.Add([pscustomobject]@{Path=$node.Path;Message=$_.Exception.Message}) }
+        } catch {
+            $errors.Add([pscustomobject]@{Path=$node.Path;Message=$_.Exception.Message})
+            foreach ($ancestorKey in $node.Ancestors) { $null=$incompleteKeys.Add($ancestorKey) }
+        }
         if ($interrupted) { break }
     }
+    while ($queue.Count -gt 0) {
+        $pending=$queue.Dequeue()
+        foreach ($ancestorKey in $pending.Ancestors) { $null=$incompleteKeys.Add($ancestorKey) }
+    }
     $complete=(-not $interrupted -and $errors.Count -eq 0)
-    foreach ($row in $rows) { $row.Complete=$complete }
+    foreach ($row in $rows) { $row.Complete=(-not $incompleteKeys.Contains($row.Key)) }
     if ($interrupted) { $errors.Add([pscustomobject]@{Path=$null;Message='Time or entry limit reached; sizes are lower bounds.'}) }
     $status='Succeeded'; if (-not $complete) { $status='Partial' }
     [pscustomobject]@{Name='Directories';QueryStatus=$status;Complete=$complete;Scope=[pscustomobject]@{Roots=@($roots | Sort-Object);ReportDepth=$MaxDepth;Source='local-non-reparse-logical-size/v1'};Started=$started;Finished=[DateTime]::UtcNow.ToString('o');Data=@($rows.ToArray());Errors=@($errors.ToArray());SkippedReparsePoints=$links;VisitedEntries=$seen;Meaning='Directory rows overlap their parents. Sum only disjoint RootSummary rows. Logical bytes may count hard links more than once; not reclaimable space. Classification never authorizes deletion.'}
@@ -93,19 +114,63 @@ function Get-MaintenanceSnapshot {
                     Get-CimInstance Win32_BaseBoard -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=('board/'+$_.Tag);Manufacturer=$_.Manufacturer;Model=$_.Product;Revision=$_.Version} }
                     Get-CimInstance Win32_BIOS -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key='bios/system';Version=$_.SMBIOSBIOSVersion;ReleaseDate=$_.ReleaseDate;Manufacturer=$_.Manufacturer} }
                     Get-CimInstance Win32_Processor -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=('cpu/'+$_.DeviceID);Name=$_.Name;Cores=$_.NumberOfCores;LogicalProcessors=$_.NumberOfLogicalProcessors} }
-                    Get-CimInstance Win32_PhysicalMemory -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=('ram/'+$_.DeviceLocator);Manufacturer=$_.Manufacturer;PartNumber=$_.PartNumber;Capacity=$_.Capacity;ConfiguredClockSpeed=$_.ConfiguredClockSpeed} }
+                    $ramKeys=New-Object 'System.Collections.Generic.HashSet[string]'([StringComparer]::OrdinalIgnoreCase)
+                    $ramIdx=0
+                    Get-CimInstance Win32_PhysicalMemory -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object {
+                        $ramIdx++
+                        $loc=if (-not [string]::IsNullOrWhiteSpace($_.DeviceLocator)) { $_.DeviceLocator.Trim() } elseif (-not [string]::IsNullOrWhiteSpace($_.Tag)) { $_.Tag.Trim() } else { "slot-$ramIdx" }
+                        $candidate='ram/'+$loc
+                        if (-not $ramKeys.Add($candidate)) {
+                            $bank=if (-not [string]::IsNullOrWhiteSpace($_.BankLabel)) { $_.BankLabel.Trim() } elseif (-not [string]::IsNullOrWhiteSpace($_.Tag)) { $_.Tag.Trim() } else { [string]$ramIdx }
+                            $candidate='ram/'+$bank+'/'+$loc
+                            if (-not $ramKeys.Add($candidate)) {
+                                $candidate=$candidate+'#'+$ramIdx
+                                $null=$ramKeys.Add($candidate)
+                            }
+                        }
+                        [pscustomobject]@{Key=$candidate;Manufacturer=$_.Manufacturer;PartNumber=$_.PartNumber;Capacity=$_.Capacity;ConfiguredClockSpeed=$_.ConfiguredClockSpeed}
+                    }
+                    $gpuKeys=New-Object 'System.Collections.Generic.HashSet[string]'([StringComparer]::OrdinalIgnoreCase)
+                    $gpuIdx=0
+                    Get-CimInstance Win32_VideoController -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object {
+                        $gpuIdx++
+                        $devId=if (-not [string]::IsNullOrWhiteSpace($_.DeviceID)) { $_.DeviceID.Trim() } else { "gpu-$gpuIdx" }
+                        $candidate='gpu/'+$devId
+                        if (-not $gpuKeys.Add($candidate)) { $candidate=$candidate+'#'+$gpuIdx; $null=$gpuKeys.Add($candidate) }
+                        [pscustomobject]@{Key=$candidate;Name=$_.Name;DriverVersion=$_.DriverVersion;PNPDeviceID=$_.PNPDeviceID;AdapterRAM=$_.AdapterRAM}
+                    }
                     $cbs=Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' -ErrorAction Stop
                     $wu=Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' -ErrorAction Stop
                     $session=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop
-                    [pscustomobject]@{Key='reboot-signals';CBS=$cbs;WindowsUpdate=$wu;PendingFileRenameOperations=($null -ne $session.PendingFileRenameOperations -and @($session.PendingFileRenameOperations).Count -gt 0);Meaning='Signals only; may not cover vendor-specific reboot requirements.'}
+                    $pendingRenames=($session.PSObject.Properties.Name -contains 'PendingFileRenameOperations' -and $null -ne $session.PendingFileRenameOperations -and @($session.PendingFileRenameOperations).Count -gt 0)
+                    [pscustomobject]@{Key='reboot-signals';CBS=$cbs;WindowsUpdate=$wu;PendingFileRenameOperations=$pendingRenames;Meaning='Signals only; may not cover vendor-specific reboot requirements.'}
                 }
                 'Storage' {
                     Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=('volume/'+$_.DeviceID);Volume=$_.DeviceID;FileSystem=$_.FileSystem;SizeBytes=$_.Size;FreeBytes=$_.FreeSpace} }
                     Get-PhysicalDisk -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=('disk/'+$_.DeviceId);Name=$_.FriendlyName;SizeBytes=$_.Size;MediaType=[string]$_.MediaType;HealthStatus=[string]$_.HealthStatus;OperationalStatus=($_.OperationalStatus -join ',');FirmwareVersion=$_.FirmwareVersion;Meaning='Storage provider summary; not a complete SMART or load test.'} }
                 }
                 'Drivers' {
-                    Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 20 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=$_.DeviceID;Name=$_.DeviceName;Class=$_.DeviceClass;Version=$_.DriverVersion;InfName=$_.InfName;Provider=$_.DriverProviderName;IsSigned=$_.IsSigned} }
-                    Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=('problem/'+$_.DeviceID);Name=$_.Name;ProblemCode=$_.ConfigManagerErrorCode} }
+                    $driverKeys=New-Object 'System.Collections.Generic.HashSet[string]'([StringComparer]::OrdinalIgnoreCase)
+                    Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 20 -ErrorAction Stop | ForEach-Object {
+                        $baseKey=if (-not [string]::IsNullOrWhiteSpace($_.DeviceID)) { $_.DeviceID.Trim() } elseif (-not [string]::IsNullOrWhiteSpace($_.InfName) -or -not [string]::IsNullOrWhiteSpace($_.DeviceName)) { 'legacy/' + ([string]$_.InfName).Trim() + '/' + ([string]$_.DeviceName).Trim() } else { $null }
+                        if ($null -ne $baseKey) {
+                            $emitKey=$null
+                            if ($driverKeys.Add($baseKey)) {
+                                $emitKey=$baseKey
+                            } elseif (-not [string]::IsNullOrWhiteSpace($_.InfName)) {
+                                $altKey=$baseKey + '#' + $_.InfName.Trim()
+                                if ($driverKeys.Add($altKey)) { $emitKey=$altKey }
+                            }
+                            if ($null -ne $emitKey) {
+                                [pscustomobject]@{Key=$emitKey;Name=$_.DeviceName;Class=$_.DeviceClass;Version=$_.DriverVersion;InfName=$_.InfName;Provider=$_.DriverProviderName;IsSigned=$_.IsSigned}
+                            }
+                        }
+                    }
+                    Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object {
+                        if (-not [string]::IsNullOrWhiteSpace($_.DeviceID)) {
+                            [pscustomobject]@{Key=('problem/'+$_.DeviceID);Name=$_.Name;ProblemCode=$_.ConfigManagerErrorCode}
+                        }
+                    }
                 }
                 'Software' {
                     foreach ($hive in @([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryHive]::CurrentUser)) {
@@ -129,7 +194,31 @@ function Get-MaintenanceSnapshot {
                     }
                 }
                 'Startup' {
-                    Get-CimInstance Win32_StartupCommand -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{Key=($_.Location+'/'+$_.User+'/'+$_.Name);Name=$_.Name;Command=$_.Command;Location=$_.Location;Meaning='Registration only; effective enabled state requires StartupApproved or application-specific verification.'} }
+                    $approvedMap=@{}
+                    foreach ($hiveRoot in @('HKLM:','HKCU:')) {
+                        foreach ($sub in @('Run','Run32','StartupFolder')) {
+                            $regPath="$hiveRoot\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$sub"
+                            if (Test-Path -LiteralPath $regPath) {
+                                $regKey=Get-Item -LiteralPath $regPath -ErrorAction Stop
+                                foreach ($valName in $regKey.GetValueNames()) {
+                                    if ([string]::IsNullOrWhiteSpace($valName)) { continue }
+                                    $raw=$regKey.GetValue($valName)
+                                    if ($raw -is [byte[]] -and $raw.Length -gt 0) {
+                                        $state=if (($raw[0] -band 1) -eq 1) { 'Disabled' } elseif ($raw[0] -in @(2,6)) { 'Enabled' } else { 'Unknown(' + $raw[0] + ')' }
+                                        if (-not $approvedMap.ContainsKey($valName)) { $approvedMap[$valName]=$state }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    $startupKeys=New-Object 'System.Collections.Generic.HashSet[string]'([StringComparer]::OrdinalIgnoreCase)
+                    Get-CimInstance Win32_StartupCommand -OperationTimeoutSec 15 -ErrorAction Stop | ForEach-Object {
+                        $baseKey=($_.Location+'/'+$_.User+'/'+$_.Name)
+                        $emitKey=$baseKey; $idx=1
+                        while (-not $startupKeys.Add($emitKey)) { $idx++; $emitKey=$baseKey+'#'+$idx }
+                        $approved=if (-not [string]::IsNullOrWhiteSpace($_.Name) -and $approvedMap.ContainsKey($_.Name)) { $approvedMap[$_.Name] } else { $null }
+                        [pscustomobject]@{Key=$emitKey;Name=$_.Name;Command=$_.Command;Location=$_.Location;StartupApproved=$approved;Meaning='Registration and StartupApproved state; application-specific autostart may still differ.'}
+                    }
                     Get-ScheduledTask -ErrorAction Stop | Where-Object TaskPath -notlike '\Microsoft\*' | ForEach-Object { [pscustomobject]@{Key=('task/'+$_.TaskPath+$_.TaskName);Name=$_.TaskName;Enabled=$_.Settings.Enabled;Actions=@($_.Actions | Select-Object Execute,Arguments,WorkingDirectory)} }
                 }
                 'Stability' {
@@ -138,8 +227,12 @@ function Get-MaintenanceSnapshot {
                         $events=@(Get-WinEvent -FilterHashtable @{LogName='System';Level=@(1,2);StartTime=$begin;EndTime=$finish} -MaxEvents $EventLimit -ErrorAction Stop)
                     } catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $events=@() } else { throw } }
                     foreach ($event in $events) { [pscustomobject]@{Key=('System/'+$event.RecordId);TimeUtc=$event.TimeCreated.ToUniversalTime().ToString('o');Provider=$event.ProviderName;Id=$event.Id;RecordId=$event.RecordId;Message=$event.Message;Xml=$event.ToXml()} }
-                    $oldest=@(Get-WinEvent -LogName System -Oldest -MaxEvents 1 -ErrorAction Stop)
-                    if ($oldest.Count -gt 0 -and $oldest[0].TimeCreated -gt $begin) { Write-Error 'Available System log starts after requested window; historical coverage is incomplete.' -ErrorAction Continue }
+                    try {
+                        $oldest=@(Get-WinEvent -LogName System -Oldest -MaxEvents 1 -ErrorAction Stop)
+                        if ($oldest.Count -gt 0 -and $oldest[0].TimeCreated -gt $begin) { Write-Error 'Available System log starts after requested window; historical coverage is incomplete.' -ErrorAction Continue }
+                    } catch {
+                        if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { Write-Error ('Unable to verify oldest System event timestamp: ' + $_.Exception.Message) -ErrorAction Continue }
+                    }
                     if ($events.Count -ge $EventLimit) { Write-Error 'Event limit reached; this is a bounded sample, not a complete event count.' -ErrorAction Continue }
                 }
                 'Security' {
@@ -148,31 +241,60 @@ function Get-MaintenanceSnapshot {
             }
         }
     }
-    foreach ($group in @($Groups | Select-Object -Unique)) {
-        $start=[DateTime]::UtcNow.ToString('o'); $job=$null; $result=$null
-        try {
-            $job=Start-Job -ScriptBlock $worker -ArgumentList (Join-Path $PSScriptRoot 'Maintenance.ReadOnly.psm1'),$group,$EventDays,$MaxEvents -ErrorAction Stop
-            $done=Wait-Job -Job $job -Timeout $GroupTimeoutSeconds
-            if ($null -eq $done) {
-                $result=[pscustomobject]@{Name=$group;Started=$start;Finished=[DateTime]::UtcNow.ToString('o');QueryStatus='TimedOut';Data=@();Errors=@([pscustomobject]@{Message='Collection exceeded its timeout. No partial job output is assumed complete.'})}
-            } else {
-                $received=@(Receive-Job -Job $job -ErrorAction Stop)
-                if ($received.Count -ne 1) { throw 'Collector did not return exactly one query record.' }
-                $result=$received[0]
-            }
-        } catch { $result=[pscustomobject]@{Name=$group;Started=$start;Finished=[DateTime]::UtcNow.ToString('o');QueryStatus='Failed';Data=@();Errors=@([pscustomobject]@{Message=$_.Exception.Message})} }
-        finally { if ($null -ne $job) { if ($job.State -in @('Running','NotStarted')) { Stop-Job -Job $job }; Remove-Job -Job $job -Force } }
-        $scope=[ordered]@{Source=($group+'/local-v1')}
-        if ($group -in @('Software','Startup','Security')) {
-            $scope['PrincipalSid']=$principalSid; $scope['IsElevated']=$isElevated
-            if ($null -ne $identityError) {
-                $result.QueryStatus='Partial'
-                $result.Errors+=@([pscustomobject]@{Message=('Caller identity could not be established: '+$identityError)})
+    $uniqueGroups=@($Groups | Select-Object -Unique)
+    $jobEntries=New-Object 'System.Collections.Generic.List[object]'
+    try {
+        foreach ($group in $uniqueGroups) {
+            $start=[DateTime]::UtcNow.ToString('o')
+            try {
+                $job=Start-Job -ScriptBlock $worker -ArgumentList (Join-Path $PSScriptRoot 'Maintenance.ReadOnly.psm1'),$group,$EventDays,$MaxEvents -ErrorAction Stop
+                $jobEntries.Add([pscustomobject]@{Group=$group;Start=$start;Job=$job;StartError=$null})
+            } catch {
+                $jobEntries.Add([pscustomobject]@{Group=$group;Start=$start;Job=$null;StartError=$_.Exception.Message})
             }
         }
-        if ($group -eq 'Software') { $scope['Coverage']='HKLM/HKCU 32/64-bit uninstall registry; excludes Store, portable applications, other users and active executable versions.' }
-        if ($group -eq 'Stability') { $scope['EventDays']=$EventDays; $scope['MaxEvents']=$MaxEvents; $scope['WindowEndUtc']=$start }
-        $collections.Add([pscustomobject]@{Name=$group;QueryStatus=$result.QueryStatus;Complete=($result.QueryStatus -in @('Succeeded','Empty'));Started=$result.Started;Finished=$result.Finished;Scope=[pscustomobject]$scope;Data=@($result.Data);Errors=@($result.Errors)})
+        $activeJobs=@($jobEntries | Where-Object { $null -ne $_.Job } | ForEach-Object Job)
+        if ($activeJobs.Count -gt 0) {
+            $null=Wait-Job -Job $activeJobs -Timeout $GroupTimeoutSeconds
+        }
+        foreach ($entry in $jobEntries) {
+            $group=$entry.Group; $start=$entry.Start; $job=$entry.Job; $result=$null
+            if ($null -eq $job) {
+                $result=[pscustomobject]@{Name=$group;Started=$start;Finished=[DateTime]::UtcNow.ToString('o');QueryStatus='Failed';Data=@();Errors=@([pscustomobject]@{Message=$entry.StartError})}
+            } else {
+                try {
+                    if ($job.State -in @('Running','NotStarted')) {
+                        $result=[pscustomobject]@{Name=$group;Started=$start;Finished=[DateTime]::UtcNow.ToString('o');QueryStatus='TimedOut';Data=@();Errors=@([pscustomobject]@{Message='Collection exceeded its timeout. No partial job output is assumed complete.'})}
+                    } else {
+                        $received=@(Receive-Job -Job $job -ErrorAction Stop)
+                        if ($received.Count -ne 1) { throw 'Collector did not return exactly one query record.' }
+                        $result=$received[0]
+                    }
+                } catch {
+                    $result=[pscustomobject]@{Name=$group;Started=$start;Finished=[DateTime]::UtcNow.ToString('o');QueryStatus='Failed';Data=@();Errors=@([pscustomobject]@{Message=$_.Exception.Message})}
+                }
+            }
+            $scope=[ordered]@{Source=($group+'/local-v1')}
+            if ($group -in @('Software','Startup','Security')) {
+                $scope['PrincipalSid']=$principalSid; $scope['IsElevated']=$isElevated
+                if ($null -ne $identityError) {
+                    if ($result.QueryStatus -in @('Succeeded','Empty')) { $result.QueryStatus='Partial' }
+                    $result.Errors+=@([pscustomobject]@{Message=('Caller identity could not be established: '+$identityError)})
+                }
+            }
+            if ($group -eq 'Software') { $scope['Coverage']='HKLM/HKCU 32/64-bit uninstall registry; excludes Store, portable applications, other users and active executable versions.' }
+            if ($group -eq 'Stability') { $scope['EventDays']=$EventDays; $scope['MaxEvents']=$MaxEvents; $scope['WindowEndUtc']=$start }
+            $collections.Add([pscustomobject]@{Name=$group;QueryStatus=$result.QueryStatus;Complete=($result.QueryStatus -in @('Succeeded','Empty'));Started=$result.Started;Finished=$result.Finished;Scope=[pscustomobject]$scope;Data=@($result.Data);Errors=@($result.Errors)})
+        }
+    } finally {
+        foreach ($entry in $jobEntries) {
+            if ($null -ne $entry.Job) {
+                try {
+                    if ($entry.Job.State -in @('Running','NotStarted')) { Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue }
+                    Remove-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+                } catch { }
+            }
+        }
     }
     [pscustomobject]@{Schema='windows-maintenance.snapshot/v1';ToolVersion='2.0.0';MachineKey=(Get-MaintenanceMachineKey);CapturedUtc=[DateTime]::UtcNow.ToString('o');Collections=@($collections.ToArray());NotCollected=@('Online update availability','Store and portable software inventory','Active application versions','Full SMART and temperatures','DISM/SFC health conclusions','Firmware update applicability','Application configuration adoption','Load stability')}
 }
