@@ -51,7 +51,7 @@ New-Item -ItemType Directory -Path $runDir -ErrorAction Stop | Out-Null
 & .\tests\Invoke-CI.ps1 -WorkDirectory (Join-Path $env:TEMP ('maintenance-ci-' + [guid]::NewGuid().ToString('N')))
 ```
 
-CI は Windows 上の PowerShell 5.1 と 7 で、構文と参照先の検査、新機能の 31 項目、既存ヘルパーの 15 項目を検証します。テストには隔離したデータを使用し、実行環境の更新・修復・クリーンアップは行いません。GitHub 上での実行結果は Actions ページで確認できます。
+CI は Windows 上の PowerShell 5.1 と 7 で、構文と参照先の検査、新機能の 36 項目、既存ヘルパーの 17 項目を検証します。テストには隔離したデータを使用し、実行環境の更新・修復・クリーンアップは行いません。GitHub 上での実行結果は Actions ページで確認できます。
 
 ## 制限とプライバシー
 

@@ -23,6 +23,8 @@ function Snapshot($Collection) {
 $old=Snapshot (Collection 'Succeeded' @([pscustomobject]@{Key='app/a';Version='1';Name='A'},[pscustomobject]@{Key='app/b';Version='1';Name='B'}))
 $new=Snapshot (Collection 'Succeeded' @([pscustomobject]@{Name='B';Version='1';Key='app/b'},[pscustomobject]@{Key='app/a';Name='A';Version='2'},[pscustomobject]@{Key='app/c';Name='C';Version=$null}))
 $d=Compare-MaintenanceSnapshot $old $new
+$changedItem=@($d.Collections[0].Changes | Where-Object Change -eq 'Changed')[0]
+Assert ($null -ne $changedItem -and @($changedItem.ChangedFields).Count -eq 1 -and $changedItem.ChangedFields[0] -eq 'Version') 'changed field names are identified'
 Assert (@($d.Collections[0].Changes | Where-Object Change -eq 'Changed').Count -eq 1) 'version change detected independent of row/property order'
 Assert (@($d.Collections[0].Changes | Where-Object Change -eq 'Added').Count -eq 1) 'new registry observation detected'
 Assert (@($d.Collections[0].Changes | Where-Object Change -eq 'Removed').Count -eq 0) 'unchanged row retained'
@@ -57,6 +59,9 @@ Assert (@((Compare-MaintenanceSnapshot $caseBefore $caseAfter).Collections[0].Ch
 $arrayBefore=Snapshot (Collection 'Succeeded' @([pscustomobject]@{Key='x';Values=@($null,1)}))
 $arrayAfter=Snapshot (Collection 'Succeeded' @([pscustomobject]@{Key='x';Values=@(1)}))
 Assert (@((Compare-MaintenanceSnapshot $arrayBefore $arrayAfter).Collections[0].Changes).Count -eq 1) 'unknown array elements are not silently removed'
+$isoStringSnap=Snapshot (Collection 'Succeeded' @([pscustomobject]@{Key='x';Timestamp='2026-09-06T12:00:00Z'}))
+$isoDateSnap=Snapshot (Collection 'Succeeded' @([pscustomobject]@{Key='x';Timestamp=[DateTime]::Parse('2026-09-06T12:00:00Z').ToUniversalTime()}))
+Assert (@((Compare-MaintenanceSnapshot $isoStringSnap $isoDateSnap).Collections[0].Changes).Count -eq 0) 'ISO-8601 string and UTC DateTime compare equal across PS versions'
 $fixture=Join-Path $workItem.FullName ('fixture-' + [guid]::NewGuid().ToString('N'))
 $project=Join-Path $fixture 'project'; $outside=Join-Path $fixture 'outside'
 $null=New-Item -ItemType Directory -Path $project,$outside,(Join-Path $project 'node_modules'),(Join-Path $project 'src'),(Join-Path $project 'models'),(Join-Path $project 'cache-unconfirmed') -Force
@@ -73,6 +78,8 @@ Assert (@($dir.Data | Where-Object Category -eq 'UserData').Count -ge 1) 'models
 Assert (@($dir.Data | Where-Object Path -like '*private.bin*').Count -eq 0) 'outside junction target absent'
 $size=@($dir.Data | Where-Object Kind -eq 'RootSummary')[0]
 Assert ($size.LogicalBytes -eq 11) 'root size covers normal files exactly once'
+$multiDir=Get-MaintenanceDirectoryInventory -Path @($project,$outside) -MaxDepth 2 -MaxSeconds 30
+Assert ($multiDir.Complete -and @($multiDir.Data | Where-Object { $_.Kind -eq 'RootSummary' -and $_.Complete }).Count -eq 2) 'disjoint roots complete independently'
 $otherDir=Get-MaintenanceDirectoryInventory -Path $outside
 $rootDiff=Compare-MaintenanceSnapshot (Snapshot $dir) (Snapshot $otherDir)
 Assert ($rootDiff.Collections[0].ComparisonStatus -eq 'Incomparable') 'same length but different root paths are different query scopes'
@@ -83,6 +90,8 @@ Reject { Get-MaintenanceDirectoryInventory -Path (Join-Path $project 'link') } '
 $limited=Get-MaintenanceDirectoryInventory -Path $project -MaxEntries 1
 Assert (-not $limited.Complete) 'entry limit remains incomplete'
 $json=Join-Path $fixture 'report.json'; $md=Join-Path $fixture 'report.md'
+Reject { Resolve-MaintenanceReportPaths -JsonPath 'relative.json' -MarkdownPath 'relative.md' } 'relative report path rejected upfront'
+Reject { Resolve-MaintenanceReportPaths -JsonPath $json -MarkdownPath $json.ToUpperInvariant() } 'case-insensitive duplicate report paths rejected'
 Export-MaintenanceReport -InputObject $new -JsonPath $json -MarkdownPath $md
 $roundTrip=Get-Content -LiteralPath $json -Raw | ConvertFrom-Json
 Assert ($roundTrip.Schema -eq $new.Schema -and $null -eq $roundTrip.Collections[0].Data[2].Version) 'JSON round trip preserves schema and unknown version'
